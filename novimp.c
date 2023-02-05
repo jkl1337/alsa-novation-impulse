@@ -1,5 +1,6 @@
 #include "asm-generic/errno-base.h"
 #include "linux/gfp_types.h"
+#include "linux/usb/ch9.h"
 #include "sound/asound.h"
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -14,10 +15,14 @@
 
 MODULE_LICENSE("GPL");
 
+#define get_endpoint(alt,ep)	(&(alt)->endpoint[ep].desc)
+
+#define MAX_INTERFACE 4
+
 #define BUFSIZE 32
 
 static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE_INTERFACE_NUMBER(0x1235, 0x001b, 2) },
+	{ USB_DEVICE_INTERFACE_CLASS(0x1235, 0x001b, 0xff) },
 	{},
 };
 
@@ -25,7 +30,6 @@ struct novimp_midi_input_endpoint {
 	struct novimp *ndev;
 	struct snd_rawmidi_substream *substream;
 
-	unsigned char buf[BUFSIZE];
 	struct urb *urb;
 };
 
@@ -37,19 +41,28 @@ struct novimp_midi_output_endpoint {
 	struct urb *urb;
 	bool active;
 
-	int pack_state;
-	unsigned char pack_data[2];
+#define STATE_UNKNOWN 0
+#define STATE_1PARAM 1
+#define STATE_2PARAM_1 2
+#define STATE_2PARAM_2 3
+#define STATE_SYSEX_0 4
+#define STATE_SYSEX_1 5
+#define STATE_SYSEX_2 6
+	int state;
+	unsigned char data[2];
 };
+
 
 struct novimp {
 	struct usb_device *dev;
 	struct snd_card *card;
-	struct usb_interface *intf;
-	int card_index;
 
 	struct snd_rawmidi *rmidi;
-	struct novimp_midi_input_endpoint inputs[2];
-	struct novimp_midi_output_endpoint outputs[2];
+	struct novimp_midi_input_endpoint inputs[MAX_INTERFACE];
+	struct novimp_midi_output_endpoint outputs[MAX_INTERFACE];
+
+	struct usb_interface *intf[MAX_INTERFACE];
+	int card_index;
 };
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
@@ -77,14 +90,6 @@ static inline void novimp_pack_packet(struct urb *urb, uint8_t p0, uint8_t p1,
 	urb->transfer_buffer_length += 4;
 }
 
-#define STATE_UNKNOWN 0
-#define STATE_1PARAM 1
-#define STATE_2PARAM_1 2
-#define STATE_2PARAM_2 3
-#define STATE_SYSEX_0 4
-#define STATE_SYSEX_1 5
-#define STATE_SYSEX_2 6
-
 static void novimp_pack_byte(uint8_t b, struct urb *urb,
 			     struct novimp_midi_output_endpoint *ep)
 {
@@ -95,86 +100,86 @@ static void novimp_pack_byte(uint8_t b, struct urb *urb,
 	} else if (b >= 0xf0) {
 		switch (b) {
 		case 0xf0:
-			ep->pack_data[0] = b;
-			ep->pack_state = STATE_SYSEX_1;
+			ep->data[0] = b;
+			ep->state = STATE_SYSEX_1;
 			break;
 		case 0xf1:
 		case 0xf3:
-			ep->pack_data[0] = b;
-			ep->pack_state = STATE_1PARAM;
+			ep->data[0] = b;
+			ep->state = STATE_1PARAM;
 			break;
 		case 0xf2:
-			ep->pack_data[0] = b;
-			ep->pack_state = STATE_2PARAM_1;
+			ep->data[0] = b;
+			ep->state = STATE_2PARAM_1;
 			break;
 		case 0xf4:
 		case 0xf5:
-			ep->pack_state = STATE_UNKNOWN;
+			ep->state = STATE_UNKNOWN;
 			break;
 		case 0xf6:
 			novimp_pack_packet(urb, 0x05, 0xf6, 0, 0);
 			break;
 		case 0xf7:
-			switch (ep->pack_state) {
+			switch (ep->state) {
 			case STATE_SYSEX_0:
 				novimp_pack_packet(urb, 0x05, 0xf7, 0, 0);
 				break;
 			case STATE_SYSEX_1:
-				novimp_pack_packet(urb, 0x06, ep->pack_data[0],
-						   0xf7, 0);
+				novimp_pack_packet(urb, 0x06, ep->data[0], 0xf7,
+						   0);
 				break;
 			case STATE_SYSEX_2:
-				novimp_pack_packet(urb, 0x07, ep->pack_data[0],
-						   ep->pack_data[1], 0xf7);
+				novimp_pack_packet(urb, 0x07, ep->data[0],
+						   ep->data[1], 0xf7);
 				break;
 			}
-			ep->pack_state = STATE_UNKNOWN;
+			ep->state = STATE_UNKNOWN;
 			break;
 		}
 	} else if (b >= 0x80) {
-		ep->pack_data[0] = b;
+		ep->data[0] = b;
 		if (b >= 0xc0 && b <= 0xdf)
-			ep->pack_state = STATE_1PARAM;
+			ep->state = STATE_1PARAM;
 		else
-			ep->pack_state = STATE_2PARAM_1;
+			ep->state = STATE_2PARAM_1;
 	} else {
-		switch (ep->pack_state) {
+		switch (ep->state) {
 		case STATE_1PARAM:
-			if (ep->pack_data[0] < 0xf0) {
-				p0 = ep->pack_data[0] >> 4;
+			if (ep->data[0] < 0xf0) {
+				p0 = ep->data[0] >> 4;
 			} else {
 				p0 = 0x02;
-				ep->pack_state = STATE_UNKNOWN;
+				ep->state = STATE_UNKNOWN;
 			}
-			novimp_pack_packet(urb, p0, ep->pack_data[0], b, 0);
+			novimp_pack_packet(urb, p0, ep->data[0], b, 0);
 			break;
 		case STATE_2PARAM_1:
-			ep->pack_data[1] = b;
-			ep->pack_state = STATE_2PARAM_2;
+			ep->data[1] = b;
+			ep->state = STATE_2PARAM_2;
 			break;
 		case STATE_2PARAM_2:
-			if (ep->pack_data[0] < 0xf0) {
-				p0 = ep->pack_data[0] >> 4;
-				ep->pack_state = STATE_2PARAM_1;
+			if (ep->data[0] < 0xf0) {
+				p0 = ep->data[0] >> 4;
+				ep->state = STATE_2PARAM_1;
 			} else {
 				p0 = 0x03;
-				ep->pack_state = STATE_UNKNOWN;
+				ep->state = STATE_UNKNOWN;
 			}
-			novimp_pack_packet(urb, p0, ep->pack_data[0],
-					   ep->pack_data[1], b);
+			novimp_pack_packet(urb, p0, ep->data[0], ep->data[1],
+					   b);
 			break;
 		case STATE_SYSEX_0:
-			ep->pack_data[0] = b;
-			ep->pack_state = STATE_SYSEX_1;
+			ep->data[0] = b;
+			ep->state = STATE_SYSEX_1;
 			break;
 		case STATE_SYSEX_1:
-			ep->pack_data[1] = b;
-			ep->pack_state = STATE_SYSEX_2;
+			ep->data[1] = b;
+			ep->state = STATE_SYSEX_2;
 			break;
 		case STATE_SYSEX_2:
-			novimp_pack_packet(urb, 0x04, ep->pack_data[0],
-					   ep->pack_data[1], b);
-			ep->pack_state = STATE_SYSEX_0;
+			novimp_pack_packet(urb, 0x04, ep->data[0], ep->data[1],
+					   b);
+			ep->state = STATE_SYSEX_0;
 			break;
 		}
 	}
@@ -215,7 +220,7 @@ static void novimp_output_complete(struct urb *urb)
 {
 	struct novimp_midi_output_endpoint *ndev_ep = urb->context;
 
-        urb->transfer_buffer_length = 0;
+	urb->transfer_buffer_length = 0;
 	ndev_ep->active = false;
 
 	if (urb->status)
@@ -273,10 +278,14 @@ static const struct snd_rawmidi_ops novimp_midi_input = {
 
 };
 
-static int novimp_init_midi(struct novimp *ndev)
+static int novimp_init_midi(struct novimp *ndev,
+			    struct usb_interface *interface)
 {
 	int ret;
 	struct snd_rawmidi *rmidi;
+	int i, next_intf;
+	struct usb_device *usb_dev = ndev->dev;
+	struct usb_host_config *config = usb_dev->actconfig;
 
 	ret = snd_rawmidi_new(ndev->card, ndev->card->shortname, 0, 1, 0,
 			      &rmidi);
@@ -293,35 +302,67 @@ static int novimp_init_midi(struct novimp *ndev)
 
 	ndev->rmidi = rmidi;
 
+	next_intf = 0;
+
+	for (i = 0; i < config->desc.bNumInterfaces &&
+		    next_intf < ARRAY_SIZE(ndev->intf);
+	     ++i) {
+		struct usb_interface *intf = config->interface[i];
+		struct usb_host_interface *hostif = intf->cur_altsetting;
+		struct usb_interface_descriptor *intfd = &hostif->desc;
+
+		if (intfd->bInterfaceSubClass != 0xff ||
+		    intfd->bNumEndpoints != 2 ||
+			(get_endpoint(hostif, 0)->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) != USB_ENDPOINT_XFER_INT ||
+			(get_endpoint(hostif, 1)->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) != USB_ENDPOINT_XFER_INT) {
+			struct usb_host_endpoint *ep = &hostif->endpoint[0];
+		}
+		//ndev->intf[next_intf] =
+	}
+
+	/* if (alt_intf) { */
+	/* 	err = usb_driver_claim_interface(&snd_novimp_usb_driver, */
+	/* 					 alt_intf, NULL); */
+	/* 	if (err < 0) { */
+	/* 		err = -EBUSY; */
+	/* 		goto probe_error; */
+	/* 	} */
+	/* } */
+
 	ndev->outputs[0].urb = usb_alloc_urb(0, GFP_KERNEL);
 	ndev->outputs[0].ndev = ndev;
 
 	usb_fill_int_urb(ndev->outputs[0].urb, ndev->dev,
 			 usb_sndintpipe(ndev->dev, 0x04), ndev->outputs[0].buf,
-                         0, novimp_output_complete, &ndev->outputs[0], 2);
+			 0, novimp_output_complete, &ndev->outputs[0], 2);
 
 	if (usb_urb_ep_type_check(ndev->outputs[0].urb)) {
 		dev_err(&ndev->dev->dev, PREFIX "invalid MIDI EP%d\n", 0x04);
 		return -EINVAL;
 	}
-        return 0;
+	return 0;
 }
 
 static void novimp_free_usb_resources(struct novimp *ndev,
 				      struct usb_interface *interface)
 {
-	struct usb_interface *alt_intf = usb_ifnum_to_if(ndev->dev, 3);
-	/* TODO kill urbs and coherent buffers */
+	int i;
 
-	usb_kill_urb(ndev->outputs[0].urb);
-
-	if (ndev->intf) {
-		usb_set_intfdata(ndev->intf, NULL);
-		ndev->intf = NULL;
+	for (i = 0; i < ARRAY_SIZE(ndev->outputs); ++i) {
+		usb_kill_urb(ndev->outputs[i].urb);
+		usb_free_urb(ndev->outputs[i].urb);
 	}
 
-	if (alt_intf) {
-		usb_driver_release_interface(&snd_novimp_usb_driver, alt_intf);
+	for (i = 0; i < ARRAY_SIZE(ndev->inputs); ++i) {
+		usb_kill_urb(ndev->inputs[i].urb);
+		usb_free_urb(ndev->inputs[i].urb);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(ndev->intf); ++i) {
+		if (ndev->intf[i]) {
+			usb_set_intfdata(ndev->intf[i], NULL);
+			usb_driver_release_interface(&snd_novimp_usb_driver, ndev->intf[i]);
+		}
 	}
 }
 
@@ -333,11 +374,11 @@ static int novimp_probe(struct usb_interface *interface,
 
 	int card_index;
 	int err;
+	int i, next_intf;
 	struct snd_card *card;
 	struct novimp *ndev;
 	char vname[32], pname[32], usbpath[32];
 	struct usb_device *usb_dev = interface_to_usbdev(interface);
-	struct usb_interface *alt_intf = usb_ifnum_to_if(usb_dev, 3);
 
 	mutex_lock(&devices_mutex);
 
@@ -362,16 +403,6 @@ static int novimp_probe(struct usb_interface *interface,
 	ndev->dev = usb_dev;
 	ndev->card = card;
 	ndev->card_index = card_index;
-	ndev->intf = interface;
-
-	if (alt_intf) {
-		err = usb_driver_claim_interface(&snd_novimp_usb_driver,
-						 alt_intf, NULL);
-		if (err < 0) {
-			err = -EBUSY;
-			goto probe_error;
-		}
-	}
 
 	strscpy(card->driver, MODULE_NAME, sizeof(card->driver));
 
@@ -385,7 +416,7 @@ static int novimp_probe(struct usb_interface *interface,
 	snprintf(card->longname, sizeof card->longname, "%s %s (%s)", vname,
 		 pname, usbpath);
 
-	err = novimp_init_midi(ndev);
+	err = novimp_init_midi(ndev, interface);
 	if (err < 0)
 		goto probe_error;
 
