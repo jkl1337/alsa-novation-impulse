@@ -9,39 +9,32 @@
 #include "usbaudio.h"
 
 #define MODULE_NAME "snd-novimp"
+#define VERSION	"0.0.1"
 #define PREFIX MODULE_NAME ": "
 
+
+MODULE_AUTHOR("John Luebs");
+MODULE_DESCRIPTION("Support for auxiliary interfaces of Novation Impulse MIDI Controllers");
 MODULE_LICENSE("GPL");
-
-#define get_endpoint(alt, ep) (&(alt)->endpoint[ep].desc)
-
-#define MAX_INTERFACE 4
-
-#define BUFSIZE 32
+MODULE_VERSION(VERSION);
 
 static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE_INTERFACE_NUMBER(0x1235, 0x001b, 0x02) },
+	{ USB_DEVICE_INTERFACE_CLASS(0x1235, 0x0019, 0xff) },
+	{ USB_DEVICE_INTERFACE_CLASS(0x1235, 0x001a, 0xff) },
+	{ USB_DEVICE_INTERFACE_CLASS(0x1235, 0x001b, 0xff) },
 	{},
 };
 
 struct midi_interface {
 	struct usb_interface *intf;
-	struct list_head midi;
 };
 
 struct novimp {
 	struct usb_device *dev;
 	struct snd_card *card;
 
-	struct midi_interface interfaces[MAX_INTERFACE];
-	int num_interfaces;
+	struct list_head midi_list;
 
-	atomic_t active;
-	atomic_t shutdown;
-	atomic_t usage_count;
-	wait_queue_head_t shutdown_wait;
-
-	int last_iface;
 	int card_index;
 };
 
@@ -70,7 +63,7 @@ static int novimp_init_midi(struct novimp *ndev,
 		.type = QUIRK_MIDI_FIXED_ENDPOINT,
 		.data = &quirk_data
 	};
-	return snd_usbmidi_create(ndev->card, interface, &ndev->interfaces[ndev->num_interfaces].midi,
+	return snd_usbmidi_create(ndev->card, interface, &ndev->midi_list,
 				  &quirk);
 }
 
@@ -92,21 +85,18 @@ static int novimp_create(struct usb_interface *intf, struct usb_device *dev,
 	}
 
 	ndev = card->private_data;
-	init_waitqueue_head(&ndev->shutdown_wait);
-	ndev->num_interfaces = 0;
-	ndev->card_index = idx;
 	ndev->dev = dev;
 	ndev->card = card;
-	atomic_set(&ndev->active, 1);
-	atomic_set(&ndev->usage_count, 0);
-	atomic_set(&ndev->shutdown, 0);
+	INIT_LIST_HEAD(&ndev->midi_list);
+	ndev->card_index = idx;
 
 	strscpy(card->driver, MODULE_NAME, sizeof(card->driver));
 
 	usb_string(dev, dev->descriptor.iProduct, pname, sizeof(pname));
 	usb_string(dev, dev->descriptor.iManufacturer, vname, sizeof(vname));
 
-	strscpy(card->shortname, pname, sizeof card->shortname);
+	snprintf(card->shortname, sizeof(card->shortname), "%sA%d", pname,
+		 intf->cur_altsetting->desc.bInterfaceNumber);
 
 	usb_make_path(dev, usbpath, sizeof(usbpath));
 	snprintf(card->longname, sizeof card->longname, "%s %s (%s)", vname,
@@ -123,79 +113,51 @@ static int novimp_probe(struct usb_interface *interface,
 	/* 			struct usb_interface *iface, void *data); */
 
 	int err, i;
-	struct novimp *ndev;
+	struct novimp *ndev = NULL;
 	struct usb_device *usb_dev = interface_to_usbdev(interface);
-	struct snd_card *card;
-	struct midi_interface *midi_if;
 
 	mutex_lock(&devices_mutex);
 
-	ndev = NULL;
 	for (i = 0; i < SNDRV_CARDS; ++i) {
-		if (novimp_devices[i] && novimp_devices[i]->dev == usb_dev) {
-			/* FIXME: need a shutdown lock */
-			ndev = novimp_devices[i];
-			// TODO: handle pm
-			// atomic_inc(&ndev->active)
+		if (!novimp_devices[i]) {
+			err = novimp_create(interface, usb_dev, i, &ndev);
+			if (err < 0) {
+				dev_info(&usb_dev->dev,
+					 PREFIX "create failed %d", err);
+				goto probe_error;
+			}
 			break;
 		}
 	}
-	if (!ndev) {
-		// no initial card structure exists - create it
-		// first find a free card slot
-		for (i = 0; i < SNDRV_CARDS; ++i) {
-			if (!novimp_devices[i]) {
-				err = novimp_create(interface, usb_dev, i, &ndev);
-				if (err < 0) {
-					dev_info(&usb_dev->dev, MODULE_NAME ": create failed %d", err);
-					goto probe_error;
-				}
-				break;
-			}
-		}
-	}
 
-	if (!ndev || ndev->num_interfaces >= MAX_INTERFACE) {
-		dev_err(&usb_dev->dev, "no available audio device\n");
+	if (!ndev) {
+		dev_err(&usb_dev->dev, "no available audio device");
 		err = -ENODEV;
 		goto probe_error;
 	}
 
-
-	card = ndev->card;
-	midi_if = &ndev->interfaces[ndev->num_interfaces];
-	INIT_LIST_HEAD(&midi_if->midi);
-	midi_if->intf = interface;
-
 	err = novimp_init_midi(ndev, interface);
 	if (err < 0) {
-		if (!card->registered)
-			snd_card_free(card);
+		dev_err(&usb_dev->dev, PREFIX "init_midi failed");
 		goto probe_error;
 	}
 
-	++ndev->num_interfaces;
-
-	if (!card->registered) {
-		err = snd_card_register(card);
-		if (err < 0) {
-			snd_card_free(card);
-			goto probe_error;
-		}
-	} else {
-		err = snd_device_register_all(card);
-		if (err < 0) {
-			dev_err(&usb_dev->dev, "failed to register a secondary device\n");
-			goto probe_error;
-		}
+	err = snd_card_register(ndev->card);
+	if (err < 0) {
+		snd_usbmidi_disconnect(ndev->midi_list.next);
+		dev_err(&usb_dev->dev, PREFIX "snd_card_register failed");
+		goto probe_error;
 	}
 
 	usb_set_intfdata(interface, ndev);
+	novimp_devices[ndev->card_index] = ndev;
 
 	mutex_unlock(&devices_mutex);
 	return 0;
 
 probe_error:
+	if (ndev)
+		snd_card_free(ndev->card);
 	mutex_unlock(&devices_mutex);
 	return err;
 }
@@ -203,19 +165,21 @@ probe_error:
 static void novimp_disconnect(struct usb_interface *interface)
 {
 	struct novimp *ndev = usb_get_intfdata(interface);
-	int i;
-
-	printk(KERN_INFO "Disconnect %p\n", interface);
 
 	if (!ndev)
 		return;
 
+	dev_info(&ndev->dev->dev, PREFIX "disconnect %p", interface);
+
 	mutex_lock(&devices_mutex);
 
-	for (i = 0; i < ndev->num_interfaces; ++i) {
+	if (!list_empty(&ndev->midi_list))
+		snd_usbmidi_disconnect(ndev->midi_list.next);
 
-	}
 	snd_card_disconnect(ndev->card);
+
+	novimp_devices[ndev->card_index] = NULL;
+
 	snd_card_free_when_closed(ndev->card);
 
 	mutex_unlock(&devices_mutex);
