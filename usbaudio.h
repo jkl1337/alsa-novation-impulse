@@ -1,7 +1,7 @@
 #ifndef USBAUDIO_H_
 #define USBAUDIO_H_
 
-#define QUIRK_ANY_INTERFACE		-1
+#define QUIRK_ANY_INTERFACE -1
 
 enum quirk_type {
 	QUIRK_IGNORE_INTERFACE,
@@ -37,28 +37,38 @@ struct snd_usb_audio_quirk {
 };
 
 struct snd_usb_midi_endpoint_info {
-	int8_t   out_ep;	/* ep number, 0 autodetect */
-	uint8_t  out_interval;	/* interval for interrupt endpoints */
-	int8_t   in_ep;
-	uint8_t  in_interval;
-	uint16_t out_cables;	/* bitmask */
-	uint16_t in_cables;	/* bitmask */
-	int16_t  assoc_in_jacks[16];
-	int16_t  assoc_out_jacks[16];
+	int8_t out_ep; /* ep number, 0 autodetect */
+	uint8_t out_interval; /* interval for interrupt endpoints */
+	int8_t in_ep;
+	uint8_t in_interval;
+	uint16_t out_cables; /* bitmask */
+	uint16_t in_cables; /* bitmask */
+	int16_t assoc_in_jacks[16];
+	int16_t assoc_out_jacks[16];
 };
 
-int __snd_usbmidi_create(struct snd_card *card,
-			 struct usb_interface *iface,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+int __snd_usbmidi_create(struct snd_card *card, struct usb_interface *iface,
+			 struct list_head *midi_list,
+			 const struct snd_usb_audio_quirk *quirk,
+			 unsigned int usb_id, unsigned int *num_rawmidis);
+#else
+int __snd_usbmidi_create(struct snd_card *card, struct usb_interface *iface,
 			 struct list_head *midi_list,
 			 const struct snd_usb_audio_quirk *quirk,
 			 unsigned int usb_id);
+#endif
 
 static inline int snd_usbmidi_create(struct snd_card *card,
-		       struct usb_interface *iface,
-		       struct list_head *midi_list,
-		       const struct snd_usb_audio_quirk *quirk)
+				     struct usb_interface *iface,
+				     struct list_head *midi_list,
+				     const struct snd_usb_audio_quirk *quirk)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	return __snd_usbmidi_create(card, iface, midi_list, quirk, 0, NULL);
+#else
 	return __snd_usbmidi_create(card, iface, midi_list, quirk, 0);
+#endif
 }
 
 void snd_usbmidi_input_stop(struct list_head *p);

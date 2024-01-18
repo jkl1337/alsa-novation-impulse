@@ -5,16 +5,17 @@
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/rawmidi.h>
+#include <linux/version.h>
 
 #include "usbaudio.h"
 
 #define MODULE_NAME "snd-novimp"
-#define VERSION	"0.0.1"
+#define VERSION "0.0.2"
 #define PREFIX MODULE_NAME ": "
 
-
 MODULE_AUTHOR("John Luebs");
-MODULE_DESCRIPTION("Support for auxiliary interfaces of Novation Impulse MIDI Controllers");
+MODULE_DESCRIPTION(
+	"Support for auxiliary interfaces of Novation Impulse MIDI Controllers");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(VERSION);
 
@@ -165,11 +166,13 @@ probe_error:
 static void novimp_disconnect(struct usb_interface *interface)
 {
 	struct novimp *ndev = usb_get_intfdata(interface);
+	struct usb_device *usb_dev = interface_to_usbdev(interface);
 
 	if (!ndev)
 		return;
 
-	dev_info(&ndev->dev->dev, PREFIX "disconnect %p", interface);
+	dev_info(&ndev->dev->dev, PREFIX "disconnect %s: %s",
+		 usb_dev->dev.kobj.name, ndev->card->shortname);
 
 	mutex_lock(&devices_mutex);
 
